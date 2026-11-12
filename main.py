@@ -10,17 +10,17 @@ every hourly chart of the 72 hours after the history ends, by log score,
 so the probabilities estimate the *mix over horizons* 0..72h of each
 place's occupant distribution: calibrated spread beats confident
 persistence (the house persistence baseline scores -43.5 on the practice
-window; this model's design target is honest turnover).
+window).
 
-Model (v2)
+Model (v4)
 ----------
 All dynamics are fit on the fly from whatever history the program is
 given (the practice archive, or the longer final history), shrunk toward
 priors measured on the kit's public archive (34 reads, 2026-10-30 to
-2026-11-07). The archive measurements behind the priors:
+2026-11-07). The archive measurements behind the model:
 
 * In log-rank space the chart mean-reverts like an Ornstein-Uhlenbeck
-  process:  log rank(t+h) ~= A(h) + B(h) * log rank(t) + Normal(0, SD(h)),
+  process:  log rank(t+h) ~= A(h) + B(h) * log rank(t) + noise(SD(h)),
   least squares over all snapshot pairs per horizon bucket:
       dt 0-12h : A=0.121, B=0.965, SD=0.240
       dt 12-24h: A=0.400, B=0.887, SD=0.434
@@ -29,47 +29,75 @@ priors measured on the kit's public archive (34 reads, 2026-10-30 to
   Short horizons are nearly persistent; by 72h the slope has halved and
   the noise is wide. A last-rank predictor beats any smoothed rank
   (MAE 0.343 vs 0.411 for a 12h-half-life EWMA at ~24h), so positions
-  start from the closing rank itself, unsmoothed.
+  start from the closing rank itself, unsmoothed. The noise is
+  heteroscedastic: residuals around the transition are wider for games
+  starting in the top and middle bands than for games stuck at the
+  bottom, so the simulation scales SD(h) by a per-starting-band
+  multiplier fit on the fly (shrunk toward 1).
 
-* Player-count growth is real signal on top of rank: regressing the
-  ~24h-ahead log-rank residual (after the transition above) on the past
-  ~24h log growth of `playing` gives slope -0.49 (growth now -> better
-  rank later, beyond what the current rank already reflects). We tilt
-  each game's starting log-rank by -0.40 * clipped growth.
-
-* Rank moves have fat tails that a single Gaussian understates: games
-  suffer regime shocks (an update lands, a video drops, growth stalls)
-  and effectively restart from a random chart position. The simulation
-  therefore uses a mixture: with probability q(h) = 0.02 + 0.0045h
+* The noise is also fat-tailed, far beyond a Gaussian: standardised
+  residuals exceed |z| = 3 in about 2% of transitions (a Gaussian says
+  0.27%), with kurtosis 7.5-17 depending on the horizon bucket. The
+  transition draw therefore uses Student-t noise with 5 degrees of
+  freedom, rescaled to the fitted SD (variance-matched, so the SD fit
+  still means what it says). Fat tails are what give mid-chart games
+  with strong momentum a real chance at the top places instead of a
+  token one. On top of that, with probability q(h) = 0.02 + 0.0045h
   (capped at 0.35) a game's drawn position is a uniform-random chart
-  position (the stationary distribution) instead of its transition draw.
+  position (a regime shock: an update lands, a video drops, growth
+  stalls and the game effectively restarts).
 
-* Newcomers: a share of each place's occupants over the window were not
-  on the closing chart at all. Measured window-averaged shares ~4% for
-  places 1-3 and ~12% for places 4-10 (rising with horizon: 0% under a
-  day for the top places, up to 11%/27% at 48-96h). That share is fit on
-  the fly the same way and left unnamed: the scorer splits a place's
-  unnamed remainder evenly over every game on that hour's chart that we
-  did not name, the best available cover for true newcomers.
+* Player-count growth is real signal on top of rank, and it does NOT
+  decay with the transition slope: regressing future log-rank on the
+  current log-rank plus growth features gives a coefficient of about
+  -0.30..-0.45 for the past ~24h log growth of `playing` at every
+  horizon band (8-80h), and -0.03..-0.09 for the freshest interval's
+  growth (per-6h normalised). The simulation therefore shifts each
+  game's drawn mean directly: mu = A + B*x0 - 0.38*g24 - 0.07*gfresh,
+  with g24 clipped to +-2.0 (the extreme growers are exactly the games
+  that jump the chart, so the clip must not strangle them).
+  (Player-count LEVEL, by contrast, adds nothing once rank and growth
+  are known: its regression coefficient is ~0.0.)
 
-* Ageing out: only games published within the last 28 days can be on the
-  chart. Where the history's details give a game's `created` date, a game
-  whose 28th day falls inside the scored window is removed from the
-  simulation for horizons past that moment. (The practice archive has no
-  details, so this only bites on recorder histories.)
+* Newcomers and abstention. A share of each place's occupants over the
+  window were not on the closing chart at all; in the practice window
+  the top places were repeatedly taken by games that appear NOWHERE in
+  the history. That share is fit on the fly per place group and left
+  unnamed -- but how the unnamed mass is divided matters as much as its
+  size: the scorer splits it evenly over the chart games we did NOT
+  name at that place, so a named row is only worth emitting if its
+  probability beats the share the game would get from the pool
+  (measured pool shares are ~0.003). The output stage therefore emits
+  only rows with p >= 0.003; the rest of the mass stays in the pool.
+  (An earlier version iterated this rule to a fixed point, recomputing
+  the pool size after each drop round; that cascade turned out to be
+  chaotically sensitive to Monte Carlo noise -- equally good models
+  scored +-1.5 apart across seeds -- so the rule is applied once, at
+  the measured indifference point, which is also where a borderline
+  row is worth the same named or unnamed and the choice stops
+  mattering.)
 
-Forecast construction: Monte Carlo. For each horizon on a grid over the
-scored window, draw each candidate game's future log-rank from the
-mixture above, sort the draws, and record who holds each of the top 10
-places. Averaging occupancy over horizons and draws gives per-place
-probabilities that are automatically normalised (each simulated chart
-fills every place exactly once) and honest about uncertainty.
+* Candidates and ageing out. Candidates are every game seen on any
+  snapshot of the last ~96 hours; games missing from the closing chart
+  start from their last seen log-rank plus a penalty that grows with
+  absence (they occasionally climb back). Only games published within
+  the last 28 days can be on the chart at all: where the history's
+  details give a game's `created` date, a game whose 28th day falls
+  inside the scored window is removed from the simulation for horizons
+  past that moment. (The practice archive has no details, so this only
+  bites on recorder histories.)
 
-Candidates are every game on any of the last five snapshots' charts;
-games missing from the closing chart start from a penalised position
-(they occasionally climb back). Everything is deterministic: fixed seed,
-fixed iteration order, so two runs on the same history write
-byte-identical output.
+Forecast construction: Monte Carlo, 3200 draws per horizon on a 2h grid
+over the scored window. For each horizon, draw each candidate game's
+future log-rank from the mixture above, sort the draws, and record who
+holds each of the top 10 places. Averaging occupancy over horizons and
+draws gives per-place probabilities that are automatically normalised
+(each simulated chart fills every place exactly once) and honest about
+uncertainty. The high draw count keeps Monte Carlo error in the tail
+probabilities -- where the log score is won and lost -- small.
+
+Everything is deterministic: fixed seed, fixed iteration order, so two
+runs on the same history write byte-identical output.
 
 Standard library only. Runs offline.
 """
@@ -84,16 +112,24 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 SEED = 20261113
-DRAWS_PER_HORIZON = 500
-HORIZON_STEP = 3.0
-MIN_P = 0.0003  # rows below this are dropped; their mass joins the unnamed share
+DRAWS_PER_HORIZON = 3200
+HORIZON_STEP = 2.0
+MIN_P = 0.0003  # rows below this are dropped before the abstention rule
+ABSTAIN_MIN_P = 0.003  # emit only rows at or above the pool-indifference point
 
-GROWTH_TILT = 0.40       # log-rank improvement per unit of log playing growth
-GROWTH_CLIP = 1.2        # clip log growth to +- this before tilting
+GROWTH24_COEF = 0.38     # future log-rank shift per unit of ~24h log playing growth
+GROWTH_FRESH_COEF = 0.07  # ... and per unit of freshest-interval growth (6h-normalised)
+GROWTH_CLIP = 2.0        # clip the 24h growth feature to +- this
+GROWTH_FRESH_CLIP = 1.5  # clip the fresh growth feature to +- this
 ABSENT_PENALTY = 0.9     # log-rank penalty for missing the closing chart
+ABSENT_PENALTY_PER_DAY = 0.30  # extra penalty per day absent beyond the first
+CANDIDATE_LOOKBACK_H = 96.0    # candidates come from snapshots this recent
 SHOCK_BASE = 0.02        # regime-shock probability at horizon 0
 SHOCK_PER_HOUR = 0.0045  # ... growing with horizon
 SHOCK_CAP = 0.35
+
+# Starting-rank bands for the noise multipliers (edges in log-rank).
+BAND_EDGES = [math.log(3.5), math.log(10.5), math.log(25.5), math.log(60.5)]
 
 # Prior transition anchors (horizon_hours, A, B, SD), measured on the kit
 # archive as described in the module docstring.
@@ -146,7 +182,7 @@ def load_history():
                 # and break the closing-chart logic if it came last.
                 # No such read exists in the practice history (every
                 # snapshot lists 92-99 games), so this never triggers
-                # there and the practice forecast is unchanged.
+                # there.
                 continue
             snapshots.append(
                 {
@@ -169,9 +205,18 @@ def window_hours_of(task):
         return None, 72.0
 
 
+def band_of(x):
+    """Band index of a starting log-rank, for the noise multipliers."""
+    for i, edge in enumerate(BAND_EDGES):
+        if x < edge:
+            return i
+    return len(BAND_EDGES)
+
+
 def fit_transitions(snapshots):
     """Least-squares (A, B, SD) per horizon bucket from all snapshot pairs,
-    shrunk toward the archive priors by pair count. Returns anchor list."""
+    shrunk toward the archive priors by pair count, plus per-band noise
+    multipliers from the residual pass. Returns (anchors, multipliers)."""
     # Accumulate sums per bucket: n, sx, sy, sxx, sxy, and residuals later.
     stats = [[0, 0.0, 0.0, 0.0, 0.0] for _ in FIT_BUCKETS]
     times = [snap["at"] for snap in snapshots]
@@ -213,23 +258,18 @@ def fit_transitions(snapshots):
             if var_x > 1e-9:
                 b = (sxy / n - mx * my) / var_x
                 a = my - b * mx
-                # Residual sd around the fitted line.
-                # E[y^2] is not accumulated; approximate sd from the prior
-                # by scaling with the slope miss is unreliable, so refit
-                # in a second pass below only when cheap. Use prior sd
-                # blended with a slope-based estimate here; the second
-                # pass (fit_residual_sd) replaces it when data allows.
+                # Residual sd is measured in the second pass
+                # (fit_residual_sd); start from the prior here.
                 sd = prior[2]
                 w = n / (n + 400.0)
                 a = w * a + (1 - w) * prior[0]
                 b = w * b + (1 - w) * prior[1]
-                sd = w * sd + (1 - w) * prior[2]
                 anchors.append((anchor_h, a, clamp(b, 0.2, 1.0), clamp(sd, 0.1, 1.1)))
                 continue
         anchors.append((anchor_h, prior[0], prior[1], prior[2]))
-    anchors = fit_residual_sd(snapshots, anchors)
+    anchors, multipliers = fit_residual_sd(snapshots, anchors)
     anchors.sort()
-    return anchors
+    return anchors, multipliers
 
 
 def prior_at(h):
@@ -264,9 +304,12 @@ def interp_anchors(anchors, h):
 
 def fit_residual_sd(snapshots, anchors):
     """Second pass: per-bucket residual sd around the blended (A, B) line,
-    shrunk toward the prior sd. Keeps the Gaussian width honest when the
-    given history churns faster or slower than the archive did."""
+    shrunk toward the prior sd, plus per-starting-band noise multipliers
+    pooled over all buckets (also shrunk, toward 1). Returns
+    (anchors, multipliers)."""
     sums = [[0, 0.0] for _ in FIT_BUCKETS]
+    band_sums = [[0, 0.0] for _ in range(len(BAND_EDGES) + 1)]
+    total_band = [0, 0.0]
     times = [snap["at"] for snap in snapshots]
     charts = [snap["chart"] for snap in snapshots]
     n_snaps = len(snapshots)
@@ -300,9 +343,13 @@ def fit_residual_sd(snapshots, anchors):
                 resid = y - (a + b * x)
                 st[0] += 1
                 st[1] += resid * resid
+                bs = band_sums[band_of(x)]
+                bs[0] += 1
+                bs[1] += resid * resid
+                total_band[0] += 1
+                total_band[1] += resid * resid
     out = []
     for bi, entry in enumerate(anchors):
-        anchor_h = FIT_BUCKETS[bi][2] if bi < len(FIT_BUCKETS) else entry[0]
         n, ss = sums[bi] if bi < len(sums) else (0, 0.0)
         prior_sd = prior_at(entry[0])[2]
         if n >= 60:
@@ -312,7 +359,16 @@ def fit_residual_sd(snapshots, anchors):
             out.append((entry[0], entry[1], entry[2], clamp(sd, 0.1, 1.15)))
         else:
             out.append(entry)
-    return out
+    multipliers = [1.0] * (len(BAND_EDGES) + 1)
+    if total_band[0] >= 200:
+        sd_all = math.sqrt(total_band[1] / total_band[0])
+        if sd_all > 1e-9:
+            for bi, (n, ss) in enumerate(band_sums):
+                if n >= 100:
+                    raw = math.sqrt(ss / n) / sd_all
+                    w = n / (n + 800.0)
+                    multipliers[bi] = clamp(1.0 + w * (raw - 1.0), 0.8, 1.3)
+    return out, multipliers
 
 
 def clamp(value, lo, hi):
@@ -378,40 +434,52 @@ def fit_unseen(snapshots, window_hours):
     return clamp(top, 0.005, 0.30), clamp(low, 0.005, 0.35)
 
 
-def growth_tilts(snapshots):
-    """Per-game log playing growth over the ~24h before the closing
-    snapshot (nearest earlier snapshot within tolerance, else the longest
-    available span up to 36h, normalised per 24h). Returns uid -> tilt
-    already multiplied by GROWTH_TILT and clipped."""
+def growth_features(snapshots):
+    """Per-game playing-growth features at the closing snapshot.
+
+    Returns uid -> (shift24, shiftfresh): the future log-rank shifts from
+    the ~24h log growth of `playing` (nearest earlier snapshot to 24h
+    before the close, span-normalised) and from the freshest interval's
+    growth (previous snapshot, normalised per 6h). Coefficients are
+    applied here; games without a usable pair get (0, 0).
+    """
     if len(snapshots) < 2:
         return {}
     last = snapshots[-1]
     last_time = last["at"]
-    base = None
-    base_span = None
+    base24 = None
+    base24_span = None
     for snap in snapshots[:-1]:
         span = (last_time - snap["at"]).total_seconds() / 3600.0
-        if span <= 0:
+        if span <= 0 or span > 40.0:
             continue
-        if base is None or abs(span - 24.0) < abs(base_span - 24.0):
-            if span <= 40.0:
-                base = snap
-                base_span = span
-    if base is None or not base_span:
-        return {}
-    tilts = {}
+        if base24 is None or abs(span - 24.0) < abs(base24_span - 24.0):
+            base24 = snap
+            base24_span = span
+    prev = snapshots[-2]
+    prev_span = (last_time - prev["at"]).total_seconds() / 3600.0
+    features = {}
     for uid, game in last["chart"].items():
-        old = base["chart"].get(uid)
-        if old is None:
-            continue
         now_playing = game.get("playing")
-        old_playing = old.get("playing")
-        if not now_playing or not old_playing:
+        if not now_playing:
+            features[uid] = (0.0, 0.0)
             continue
-        growth = math.log(now_playing / old_playing) * (24.0 / base_span)
-        growth = clamp(growth, -GROWTH_CLIP, GROWTH_CLIP)
-        tilts[uid] = -GROWTH_TILT * growth
-    return tilts
+        shift24 = 0.0
+        if base24 is not None and base24_span:
+            old = base24["chart"].get(uid)
+            if old is not None and old.get("playing"):
+                g = math.log(now_playing / old["playing"]) * (24.0 / base24_span)
+                shift24 = -GROWTH24_COEF * clamp(g, -GROWTH_CLIP, GROWTH_CLIP)
+        shiftfresh = 0.0
+        if 0 < prev_span <= 12.0:
+            old = prev["chart"].get(uid)
+            if old is not None and old.get("playing"):
+                g = math.log(now_playing / old["playing"]) * (6.0 / prev_span)
+                shiftfresh = -GROWTH_FRESH_COEF * clamp(
+                    g, -GROWTH_FRESH_CLIP, GROWTH_FRESH_CLIP
+                )
+        features[uid] = (shift24, shiftfresh)
+    return features
 
 
 def exit_hours(snapshots, window_start):
@@ -441,34 +509,42 @@ def exit_hours(snapshots, window_start):
     return exits
 
 
-def candidate_positions(snapshots, tilts):
+def candidate_positions(snapshots):
     """Map universe_id -> starting log-rank for the simulation.
 
-    Closing-chart games start at their closing log-rank plus their growth
-    tilt. Games seen in the four snapshots before the closing one but
-    missing from it start from their last seen log-rank plus a penalty:
-    they occasionally climb back, but rarely.
+    Closing-chart games start at their closing log-rank. Games seen on
+    any snapshot of the last ~96 hours but missing from the closing
+    chart start from their last seen log-rank plus a penalty that grows
+    with their absence: they occasionally climb back, but rarely.
     """
     if not snapshots:
         return {}
     positions = {}
-    last_chart = snapshots[-1]["chart"]
+    last = snapshots[-1]
+    last_chart = last["chart"]
+    last_time = last["at"]
     for uid, game in last_chart.items():
-        positions[uid] = math.log(max(1, int(game["rank"]))) + tilts.get(uid, 0.0)
-    for snap in reversed(snapshots[-5:-1]):
+        positions[uid] = math.log(max(1, int(game["rank"])))
+    for snap in reversed(snapshots[:-1]):
+        absent_h = (last_time - snap["at"]).total_seconds() / 3600.0
+        if absent_h > CANDIDATE_LOOKBACK_H:
+            break
+        extra_days = max(0.0, absent_h / 24.0 - 1.0)
+        penalty = ABSENT_PENALTY + ABSENT_PENALTY_PER_DAY * extra_days
         for uid, game in snap["chart"].items():
             if uid not in positions:
-                positions[uid] = (
-                    math.log(max(1, int(game["rank"]))) + ABSENT_PENALTY
-                )
+                positions[uid] = math.log(max(1, int(game["rank"]))) + penalty
     return positions
 
 
-def simulate(positions, exits, window_start, window_hours, places, anchors, chart_size):
+def simulate(positions, features, exits, window_hours, places, anchors,
+             multipliers, chart_size):
     """Monte Carlo occupancy counts: counts[uid][place] over all draws."""
     rng = random.Random(SEED)
     uids = sorted(positions)
     x0 = [positions[uid] for uid in uids]
+    shift = [features.get(uid, (0.0, 0.0)) for uid in uids]
+    band = [band_of(x) for x in x0]
     exit_h = [exits.get(uid) for uid in uids]
     counts = {uid: [0] * (places + 1) for uid in uids}
     log_chart = math.log(max(chart_size, places + 1))
@@ -494,7 +570,9 @@ def simulate(positions, exits, window_start, window_hours, places, anchors, char
                     # (the stationary distribution of ranks).
                     y = math.log(1.0 + rng.random() * (chart_size - 1))
                 else:
-                    y = a + b * x + rng.gauss(0.0, sd)
+                    s24, sfresh = shift[idx]
+                    mu = a + b * x + s24 + sfresh
+                    y = mu + rng.gauss(0.0, sd * multipliers[band[idx]]) * math.sqrt(1.5 / rng.gammavariate(2.5, 1.0))
                 if y < 0.0:
                     y = 0.0
                 elif y > log_chart + 0.7:
@@ -508,20 +586,35 @@ def simulate(positions, exits, window_start, window_hours, places, anchors, char
     return counts, total_draws
 
 
+def apply_abstention(rows):
+    """Emit only rows whose probability reaches ABSTAIN_MIN_P.
+
+    The scorer splits a place's unnamed mass evenly over the chart
+    games not named there; measured pool shares are ~0.003, so a row
+    below that point would score worse than the pool share the same
+    game would receive unnamed, and its mass is worth more left in the
+    pool for the true newcomers. Applied once, not iterated: at the
+    threshold a borderline row is worth the same named or unnamed, so
+    the choice is stable under Monte Carlo noise. `rows` is a list of
+    (uid, p) for one place; returns a dict uid -> p."""
+    return {uid: p for uid, p in rows if p >= ABSTAIN_MIN_P}
+
+
 def main():
     task, snapshots = load_history()
     places = int(task.get("places", 10))
     window_start, window_hours = window_hours_of(task)
 
-    anchors = fit_transitions(snapshots)
+    anchors, multipliers = fit_transitions(snapshots)
     unseen_top, unseen_low = fit_unseen(snapshots, window_hours)
-    tilts = growth_tilts(snapshots)
+    features = growth_features(snapshots)
     exits = exit_hours(snapshots, window_start)
-    positions = candidate_positions(snapshots, tilts)
+    positions = candidate_positions(snapshots)
     chart_size = len(snapshots[-1]["chart"]) if snapshots else 97
 
     counts, total_draws = simulate(
-        positions, exits, window_start, window_hours, places, anchors, chart_size
+        positions, features, exits, window_hours, places, anchors,
+        multipliers, chart_size,
     )
 
     probabilities = []
@@ -535,11 +628,14 @@ def main():
                 rows.append((uid, p))
         rows.sort(key=lambda item: (-item[1], item[0]))
         rows = rows[:100]
+        named = apply_abstention(rows)
+        # Guard against rounding pushing a place's sum over 1 (the
+        # abstention target mass is named_mass, well below 1).
         scale = 1.0
-        total = sum(p for _, p in rows)
+        total = sum(named.values())
         if total > named_mass > 0:
             scale = named_mass / total
-        for uid, p in rows:
+        for uid, p in sorted(named.items(), key=lambda item: (-item[1], item[0])):
             probabilities.append(
                 {"universe_id": uid, "place": place, "p": round(p * scale, 6)}
             )
