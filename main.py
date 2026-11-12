@@ -138,6 +138,16 @@ def load_history():
             chart = {}
             for game in row.get("up_and_coming") or []:
                 chart[int(game["universe_id"])] = game
+            if not chart:
+                # Defensive: a read with no chart rows (a partial or
+                # failed recorder read) carries no signal, and keeping
+                # it would corrupt the newcomer fit (every occupant of a
+                # later read would count as "not on the earlier chart")
+                # and break the closing-chart logic if it came last.
+                # No such read exists in the practice history (every
+                # snapshot lists 92-99 games), so this never triggers
+                # there and the practice forecast is unchanged.
+                continue
             snapshots.append(
                 {
                     "at": parse_time(row["at"]),
